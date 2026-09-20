@@ -1,10 +1,11 @@
 # UserTracker (Vencord userplugin)
 
-Watch specific users across servers you share: roles, nick, join, leave/remove, ban, plus you-target friend changes. Toasts + persistent history.
+Watch specific users across servers you share: roles, nick, join, leave/remove, ban, plus you-target friend changes. Optional mutual-friend polling detects when a tracked user friends/unfriends YOUR friends. Toasts + persistent history.
 
 ## Limits (read first)
 - `left or was removed` cannot distinguish kick vs voluntary leave without Audit Log perms. Check the server Audit Log for certainty.
-- Friend tracking covers only YOU and a tracked user. Discord never sends other people's friend events, so target-stranger tracking is impossible.
+- Instant friend tracking covers only YOU and a tracked user. Discord never sends other people's friend events, so target-stranger tracking is impossible.
+- Mutual-friend polling (opt-in, off by default) sees ONLY people who are also your friends — a tracked user friending a stranger is invisible by design. It works by re-reading the profile's `mutual_friends` list on a timer, so alerts lag up to one interval, and timed REST calls carry some rate-limit risk — keep the interval at 60+ minutes.
 - Client mods violate Discord ToS. Test with an alt and a private test server.
 
 ## Install (Vencord source build only; official installer cannot load custom plugins)
@@ -18,6 +19,12 @@ Watch specific users across servers you share: roles, nick, join, leave/remove, 
 2. Faster: right-click any user → Track user (UserTracker).
 3. Trigger a test: change the tracked user's role in a shared server → toast `Tracker • @name in Server: +Role`.
 4. History persists via DataStore key `UserTracker_history` across restarts.
+
+## Mutual-friend watching (opt-in)
+Detects when a tracked user friends/unfriends someone on YOUR friend list.
+1. First verify the data source (one time): open a tracked user's profile with DevTools → Network open, find the `profile` request, and confirm its `mutual_friends` array lists ALL your mutuals (compare against the count). If it's a truncated preview, leave this feature off — diffing a preview false-alerts.
+2. Enable `watchMutualFriends` and pick `mutualCheckMinutes` (60 default, up to 120). The first cycle only takes a silent baseline — no flood of old news. Snapshots persist under DataStore key `UserTracker_mutuals`, so restarts resume diffing instead of re-baselining.
+3. Live test (needs a cooperating friend or second account B that is friends with you): track T, have B friend T → within one cycle expect `Tracker • @T became friends with @B`; have B unfriend T → expect `unfriended`. Toggling the plugin off/on requires re-enabling to pick up setting changes; alerts lag up to one interval by design.
 
 ## Verify it works
 - `node --test tests/userTracker.utils.test.ts` passes in this repo (pure logic).

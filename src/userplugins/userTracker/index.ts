@@ -1,8 +1,9 @@
 import { definePluginSettings } from "@api/Settings";
 import * as DataStore from "@api/DataStore";
 import definePlugin, { OptionType } from "@utils/types";
-import { GuildStore, GuildMemberStore, UserStore, showToast, Toasts, Menu, React } from "@webpack/common";
+import { GuildStore, GuildMemberStore, UserStore, showToast, Toasts, Menu, React, RestAPI } from "@webpack/common";
 import { buildEntry, diffRoles, formatRoleChange, formatSimpleEvent, isTracked, parseTrackedIds, trimHistory } from "./utils";
+import { computeBackoff, diffMutuals, formatMutualEvent, snapshotUsable } from "./mutuals";
 import type { TrackerEntry } from "./utils";
 
 const settings = definePluginSettings({
@@ -15,11 +16,28 @@ const settings = definePluginSettings({
     trackRelationship: { type: OptionType.BOOLEAN, description: "Notify when a tracked user friends/unfriends YOU (only direction Discord exposes)", default: true },
     showToast: { type: OptionType.BOOLEAN, description: "Show toast popups (history always records when enabled below)", default: true },
     historyLimit: { type: OptionType.NUMBER, description: "Max history entries kept (1-1000)", default: 200 },
+    watchMutualFriends: { type: OptionType.BOOLEAN, description: "Poll tracked users' mutual-friends lists for adds/removes among YOUR friends. Timed REST calls carry rate-limit risk — keep the interval long. Off by default.", default: false },
+    mutualCheckMinutes: {
+        type: OptionType.SELECT,
+        description: "How often to re-check mutual friends per tracked user",
+        options: [
+            { label: "Every 15 minutes (highest risk)", value: 15 },
+            { label: "Every 30 minutes", value: 30 },
+            { label: "Every 60 minutes", value: 60, default: true },
+            { label: "Every 120 minutes (safest)", value: 120 },
+        ],
+    },
 });
 
 const HISTORY_KEY = "UserTracker_history";
+const MUTUALS_KEY = "UserTracker_mutuals";
 const roleCache = new Map<string, string[]>();
 const nickCache = new Map<string, string | null>();
+const mutualCache = new Map<string, string[]>();
+const mutualFailures = new Map<string, number>();
+const mutualSkipCycles = new Map<string, number>();
+let mutualTimer: ReturnType<typeof setInterval> | null = null;
+let mutualTimeouts: ReturnType<typeof setTimeout>[] = [];
 const history: TrackerEntry[] = [];
 let loaded = false;
 
@@ -140,6 +158,75 @@ function handleBanRemove(e: any): void {
     void record(buildEntry({ userId, userTag: userTagOf(userId), guildId, guildName: guildNameOf(guildId), kind: "unban", detail }));
 }
 
+async function persistMutuals(): Promise<void> {
+    try {
+        await DataStore.set(MUTUALS_KEY, [...mutualCache.entries()]);
+    } catch { /* best-effort persistence */ }
+}
+
+async function checkMutuals(userId: string, silentBaseline: boolean): Promise<void> {
+    const skipped = mutualSkipCycles.get(userId) ?? 0;
+    if (skipped > 0) {
+        mutualSkipCycles.set(userId, skipped - 1);
+        return;
+    }
+    let body: any;
+    try {
+        body = await RestAPI.get({ url: `/users/${userId}/profile?with_mutual_friends_count=true` });
+    } catch {
+        const failures = (mutualFailures.get(userId) ?? 0) + 1;
+        mutualFailures.set(userId, failures);
+        mutualSkipCycles.set(userId, computeBackoff(failures));
+        return;
+    }
+    mutualFailures.set(userId, 0);
+    const list = body?.mutual_friends;
+    if (!Array.isArray(list)) return;
+    const count = body?.mutual_friends_count;
+    const ids = list.map((f: any) => String(f?.id ?? "")).filter((id: string) => id.length > 0);
+    if (!snapshotUsable(ids.length, typeof count === "number" ? count : undefined)) return;
+    const prev = mutualCache.get(userId);
+    mutualCache.set(userId, ids);
+    void persistMutuals();
+    if (silentBaseline || !prev) return;
+    const { added, removed } = diffMutuals(prev, ids);
+    const tag = userTagOf(userId);
+    for (const friendId of added) {
+        const detail = formatMutualEvent(tag, userTagOf(friendId), "added");
+        void record(buildEntry({ userId, userTag: tag, guildId: "@me", guildName: "Mutual friends", kind: "mutual-friend", detail }));
+    }
+    for (const friendId of removed) {
+        const detail = formatMutualEvent(tag, userTagOf(friendId), "removed");
+        void record(buildEntry({ userId, userTag: tag, guildId: "@me", guildName: "Mutual friends", kind: "mutual-friend", detail }));
+    }
+}
+
+function runMutualCycle(silentBaseline: boolean): void {
+    const list = trackedList();
+    list.forEach((userId, i) => {
+        const delay = i * 15000 + Math.floor(Math.random() * 10000);
+        mutualTimeouts.push(setTimeout(() => void checkMutuals(userId, silentBaseline), delay));
+    });
+}
+
+function stopMutualLoop(): void {
+    if (mutualTimer !== null) {
+        clearInterval(mutualTimer);
+        mutualTimer = null;
+    }
+    for (const t of mutualTimeouts) clearTimeout(t);
+    mutualTimeouts = [];
+}
+
+function startMutualLoop(): void {
+    stopMutualLoop();
+    if (!settings.store.watchMutualFriends) return;
+    const minutes = Number(settings.store.mutualCheckMinutes ?? 60);
+    const ms = Math.min(120, Math.max(15, Number.isFinite(minutes) ? minutes : 60)) * 60000;
+    runMutualCycle(true);
+    mutualTimer = setInterval(() => runMutualCycle(false), ms);
+}
+
 function handleRelationship(e: any, action: "add" | "remove"): void {
     const userId: string | undefined = e?.userId ?? e?.user?.id;
     if (!userId || !isTracked(userId, trackedList())) return;
@@ -166,7 +253,7 @@ function handleRelationship(e: any, action: "add" | "remove"): void {
 
 export default definePlugin({
     name: "UserTracker",
-    description: "Watch specific users across mutual servers: roles, nick, join, leave/remove, ban, plus you-target friend changes. Toasts + persistent history.",
+    description: "Watch specific users across mutual servers: roles, nick, join, leave/remove, ban, you-target friend changes, plus optional mutual-friend polling. Toasts + persistent history.",
     authors: [{ name: "you", id: 0n }],
     settings,
     flux: {
@@ -207,6 +294,14 @@ export default definePlugin({
                 const saved = await DataStore.get<TrackerEntry[]>(HISTORY_KEY);
                 if (Array.isArray(saved)) history.push(...trimHistory(saved, 1000));
             } catch { /* fresh start with empty history */ }
+            try {
+                const savedMutuals = await DataStore.get<[string, string[]][]>(MUTUALS_KEY);
+                if (Array.isArray(savedMutuals)) {
+                    for (const [userId, ids] of savedMutuals) {
+                        if (typeof userId === "string" && Array.isArray(ids)) mutualCache.set(userId, ids);
+                    }
+                }
+            } catch { /* fresh mutual baseline */ }
         }
         try {
             for (const userId of trackedList()) {
@@ -220,9 +315,11 @@ export default definePlugin({
                 }
             }
         } catch { /* stores not ready yet; cache fills lazily */ }
+        startMutualLoop();
     },
     stop() {
         roleCache.clear();
         nickCache.clear();
+        stopMutualLoop();
     },
 });
