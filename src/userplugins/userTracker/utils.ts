@@ -43,8 +43,8 @@ export function formatSimpleEvent(userTag: string, guildName: string, label: str
     return `Tracker • ${userTag} in ${guildName}: ${label}`;
 }
 
-export function trimHistory<T>(entries: T[], limit: number): T[] {
-    const n = Math.max(0, Math.min(Math.floor(limit), 1000));
+export function trimHistory<T>(entries: T[], limit: number = 200): T[] {
+    const n = Number.isFinite(limit) ? Math.max(1, Math.min(Math.floor(limit), 1000)) : 200;
     if (entries.length <= n) return entries;
     return entries.slice(entries.length - n);
 }

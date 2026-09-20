@@ -55,3 +55,38 @@ describe("buildEntry", () => {
         assert.ok(typeof e.ts === "number" && e.ts > 0);
     });
 });
+
+describe("trimHistory caps", () => {
+    it("caps at 1000", () => {
+        const arr = new Array(1005).fill(0).map((_, i) => i);
+        const out = trimHistory(arr, 2000);
+        assert.equal(out.length, 1000);
+        assert.deepEqual(out.slice(0, 2), [5, 6]);
+        assert.equal(out[out.length - 1], 1004);
+    });
+});
+
+describe("trimHistory default", () => {
+    it("default keeps 200", () => {
+        const arr = new Array(250).fill(0).map((_, i) => i);
+        const out = trimHistory(arr);
+        assert.equal(out.length, 200);
+        assert.equal(out[0], 50);
+        assert.equal(out[out.length - 1], 249);
+    });
+});
+
+describe("parseTrackedIds lengths", () => {
+    it("ignores 16-digit and keeps 17-digit", () => {
+        assert.deepEqual(parseTrackedIds("1234567890123456"), []);
+        assert.deepEqual(parseTrackedIds("12345678901234567"), ["12345678901234567"]);
+        assert.deepEqual(parseTrackedIds("1234567890123456 12345678901234567"), ["12345678901234567"]);
+    });
+});
+
+describe("formatRoleChange empty", () => {
+    it("returns message containing no change", () => {
+        const msg = formatRoleChange("@bob", "MyServer", [], []);
+        assert.ok(msg.includes("no change"));
+    });
+});

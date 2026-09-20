@@ -28,3 +28,4 @@ Watch specific users across servers you share: roles, nick, join, leave/remove, 
 - Plugin not listed: wrong folder depth (`userplugins/userTracker/index.ts`, not nested deeper), or empty file in `userplugins/` causing `localeCompare` error — remove empties and rebuild.
 - No toast on role change: ID typo, event toggles off, or cache cold on first start (change role twice after enabling).
 - `DataStore` empty after restart: normal if IndexedDB was cleared; history is best-effort persistent.
+- Authors placeholder: replace authors: [{ name: "you", id: 0n }] in index.ts with your own { name, id } (right-click your avatar → Copy User ID, numeric, with n suffix) before building.
