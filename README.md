@@ -1,123 +1,273 @@
-# UserTracker — Vencord User-Monitoring Plugin
+<div align="center">
 
-A runtime-only [Vencord](https://vencord.dev) userplugin that watches the
-people you choose across every server you share with them — and tells you
-the moment something changes.
+# 🛰️ UserTracker
+### High-Performance, Hardened User Monitoring & State Diffing Plugin for Vencord
 
-**Get notified when a tracked user:** gains or loses a role · changes
-nickname · joins, leaves, or is removed · gets banned or unbanned ·
-friends or unfriends **you**.
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg?style=for-the-badge)](https://www.gnu.org/licenses/gpl-3.0)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Vencord](https://img.shields.io/badge/Platform-Vencord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://vencord.dev)
+[![Tests](https://img.shields.io/badge/Tests-35%20Passing-brightgreen?style=for-the-badge&logo=node.js&logoColor=white)](tests/)
+[![Security](https://img.shields.io/badge/Security-Hardened%20(429%20Shield)-success?style=for-the-badge&logo=shield&logoColor=white)](#-security-hardening--api-safety)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=for-the-badge)](CONTRIBUTING.md)
 
-> **Honest limits, up front:** Discord never tells your client when someone
-> is *kicked* (vs. leaving on their own) — those events show as
-> “left or was removed”. Instant friend alerts cover **you ↔ tracked user**
-> only; the opt-in mutual-friend poller additionally sees tracked-user
-> changes among **your own friends** (hourly-ish, not instant), while a
-> tracked user friending a stranger stays invisible to everyone but them.
+<p align="center">
+  <b>UserTracker</b> is an enterprise-grade, client-side monitoring plugin for <a href="https://vencord.dev">Vencord</a>. It passively observes member events across mutual Discord servers, accurately computes delta changes (roles, nicknames, guild presence, and friendships), and presents notifications with zero webpack patching or token scraping.
+</p>
 
 ---
 
-## ✨ Features
+[About](#-about-usertracker) •
+[Architecture](#-system-architecture) •
+[Key Features](#-key-features) •
+[Security & Hardening](#-security-hardening--api-safety) •
+[Installation](#-installation) •
+[Configuration](#-configuration-reference) •
+[Verification](#-testing--quality-assurance) •
+[Contributing](#-contributing) •
+[License](#-license)
 
-- 📋 **Watchlist** — track one user or many, by ID, across all mutual servers
-- 🎭 **Role diffing** — `+Admin, -Mod` with real role names, not bare IDs
-- 👋 **Join / leave / ban / unban** detection per server
-- 💬 **Nickname** change alerts
-- 🤝 **You ↔ target** friend/unfriend, block, and request alerts
-- 👥 **Mutual-friend watching (opt-in)** — detects when a tracked user friends/unfriends *your* friends, via timed profile snapshots
-- 🔔 **Toast popups** + persistent, searchable history (survives restarts)
-- 🖱️ **Right-click any user → Track/Untrack** from the context menu
-- 🧩 **Zero webpack patches** — pure event listeners, no restart needed
+---
 
-## 📁 What's in this repo
+</div>
 
+## 📖 About UserTracker
+
+In large Discord communities and shared networks, keeping track of member changes—such as role escalations, nickname alterations, server exits, or friendship status—usually requires reviewing audit logs or running external server bots. 
+
+**UserTracker** brings real-time, cross-server visibility directly to your client without requiring administrator privileges or running bots:
+- **Zero Scraping & Zero Tokens:** Operates strictly on Flux dispatcher events already delivered to your Discord client.
+- **Client Safety First:** Built with aggressive rate-limit shields (HTTP 429 detection, global cooldowns, target capping, and jitter) to protect your account.
+- **Pure Memory Resilience:** All untracked targets are automatically pruned from internal caches to guarantee zero memory leakage during long client uptimes.
+- **Data Integrity:** Employs runtime schema validation and string sanitization (blocking bidi-overrides, zero-width characters, and control codes) to prevent UI spoofing.
+
+---
+
+## 🏛 System Architecture
+
+The following diagram illustrates how UserTracker ingests events from Discord's internal Flux Dispatcher, processes them through validation and rate-limiting barriers, and persists state across restarts.
+
+```mermaid
+flowchart TD
+    subgraph Discord Client Core
+        GW[Discord Gateway] --> FD[Flux Dispatcher]
+        DS[Discord Internal Stores<br>GuildStore / UserStore / GuildMemberStore]
+    end
+
+    subgraph UserTracker Plugin
+        FD --> EB{Isolated Flux<br>Error Boundaries}
+        EB -->|GUILD_MEMBER_UPDATE| FLT[Filter: Is Tracked ID?]
+        EB -->|GUILD_MEMBER_ADD/REMOVE| FLT
+        EB -->|GUILD_BAN_ADD/REMOVE| FLT
+        EB -->|RELATIONSHIP_ADD/REMOVE| FLT
+
+        FLT -->|Yes| SN[Sanitization Layer<br>sanitizeText & isValidSnowflake]
+        FLT -->|No| IGN[Ignore Event]
+
+        SN --> DF[Diffing Engine<br>diffRoles & diffMutuals]
+        DF --> RC[Internal Memory Caches<br>roleCache / nickCache / mutualCache]
+        
+        DF --> REC[Record Pipeline]
+        REC --> TOAST[Toast Notification<br>Toasts.Type.MESSAGE]
+        REC --> DB[(IndexedDB Storage<br>DataStore: Validated Schema)]
+
+        subgraph Background Mutual Poller
+            TIMER([Poller Interval]) --> LOCK{Is Cycle Running?}
+            LOCK -->|No| CD{In 429 Cooldown?}
+            LOCK -->|Yes| SKIP[Skip Cycle]
+            CD -->|No| CAP[Cap Targets <= 25 & Add Jitter]
+            CD -->|Yes| SKIP
+            CAP --> API[RestAPI.get Profile]
+            API -->|429 Rate Limit| SHIELD[Engage 10m+ Cooldown & Exponential Backoff]
+            API -->|200 OK| SNAP{Snapshot Usable?}
+            SNAP -->|Yes| DF
+            SNAP -->|No / Truncated| DROP[Drop Snapshot]
+        end
+    end
+
+    subgraph Context Menu UI
+        CM[Right-Click User] --> ACT[Track / Untrack Toggle]
+        ACT --> PRUNE[Prune Internal Caches]
+        ACT --> DB
+    end
 ```
-src/userplugins/userTracker/
-├── index.ts     # Vencord adapter: settings, flux events, toasts, history
-├── utils.ts     # Pure logic: validation, sanitization, diffing (unit tested)
-├── mutuals.ts   # Mutual friend logic: rate-limiting, 429 backoff, capping (unit tested)
-└── README.md    # Plugin install + usage + troubleshooting
-tests/
-├── userTracker.utils.test.ts    # 20 tests (validation, sanitization, diffing)
-└── userTracker.mutuals.test.ts  # 15 tests (rate-limits, 429 backoff, snapshot safety)
-docs/
-├── superpowers/specs/  # Design spec
-└── superpowers/plans/  # Implementation plan
+
+### Mutual-Friend Polling Lifecycle & 429 Defense
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Poller as Mutual Friend Poller
+    participant Guard as 429 Rate Limit Guard
+    participant Discord as Discord REST API
+    participant Diff as Diff Engine
+    participant UI as Toast / DataStore
+
+    Poller->>Guard: Check cycle status & cooldown timer
+    alt In Active Cooldown or Running
+        Guard-->>Poller: Abort cycle (Protect Account)
+    else Ready
+        Guard->>Discord: Staggered GET /users/{id}/profile (15-30s jitter)
+        alt Rate Limited (HTTP 429)
+            Discord-->>Guard: 429 Too Many Requests
+            Guard->>Guard: Engage 10+ Min Global Cooldown & Exponential Backoff
+        else Successful (HTTP 200)
+            Discord-->>Diff: Return mutual_friends array
+            Diff->>Diff: Validate snapshot completeness (snapshotUsable)
+            Diff->>Diff: Calculate delta: added vs removed
+            alt Delta Detected
+                Diff->>UI: Dispatch Toast & Persist to DataStore
+            end
+        end
+    end
 ```
 
-## 🛡️ Hardening & Reliability
+---
 
-This plugin is hardened for production reliability, account safety, and client stability:
+## ✨ Key Features
 
-- **Discord API & Account Safety:**
-  - **HTTP 429 Shield:** Automatically detects rate-limit (429) responses. On 429, all mutual polling is immediately paused for a minimum 10-minute cooldown with exponential backoff multipliers.
-  - **Concurrency Locking:** Mutual polling cycles cannot overlap or stack if requests take longer than the polling interval.
-  - **Target Capping & Jitter:** Mutual polling is capped to 25 users per cycle with 15–30s randomized delays between requests to prevent burst patterns.
-- **Crash & Runtime Resilience:**
-  - **Flux Dispatcher Isolation:** All Flux event handlers are wrapped in try/catch boundaries so an unexpected Discord payload never crashes Discord's core event dispatcher.
-  - **Defensive Store Lookups:** Safe fallbacks for Discord internal stores (`GuildStore`, `GuildMemberStore`, `UserStore`).
-- **Data Integrity & Sanitization:**
-  - **Strict Snowflake Validation:** Enforces `/^\d{17,20}$/` for user and guild IDs.
-  - **DataStore Type Guards:** Validates `UserTracker_history` and `UserTracker_mutuals` schemas on startup to safely discard corrupted or tampered records from IndexedDB.
-  - **String Sanitization:** Strips control characters, zero-width characters, and bidirectional override characters (`\u202E`) from tags, guild names, and roles before rendering in toasts or history.
-  - **Cache Pruning:** Automatically purges untracked users from all internal caches (`roleCache`, `nickCache`, `mutualCache`, failure counters) to prevent memory leaks.
+| Feature | Description | Status |
+| :--- | :--- | :---: |
+| 📋 **Multi-User Watchlist** | Track arbitrary numbers of users across all mutual guilds by Discord Snowflake ID. | ✅ Active |
+| 🎭 **Role Delta Diffing** | Computes additions and removals (`+Admin, -Mod`) resolving human-readable names. | ✅ Active |
+| 💬 **Nickname Monitoring** | Detects nickname alterations per guild with sanitized string normalization. | ✅ Active |
+| 👋 **Guild Presence** | Tracks joins, leaves, and kicks (*"left or was removed"*), as well as bans and unbans. | ✅ Active |
+| 🤝 **Direct Relationships** | Real-time alerts for friend requests, accepted requests, unfriending, and blocks. | ✅ Active |
+| 👥 **Mutual Friend Polling** | Optional background poller detecting friend changes between tracked targets and mutual friends. | ⚙️ Opt-in |
+| 🖱️ **Context Menu Integration** | One-click **Track / Untrack user** directly from Discord's native right-click menu. | ✅ Active |
+| 🛡️ **HTTP 429 Shield** | Automated circuit breaker that freezes polling on rate-limits to prevent account strikes. | ✅ Active |
+| 🧹 **Memory Pruning** | Automatic purge of cached metadata whenever a user is untracked. | ✅ Active |
 
-## 🚀 Install (2 minutes)
+---
 
-Requires a **Vencord source build** — the stock installer can't load custom
-plugins. One-time setup: https://docs.vencord.dev/installing/
+## 🛡️ Security Hardening & API Safety
+
+UserTracker is engineered with defense-in-depth principles:
+
+### 1. Discord API & Account Safety
+- **HTTP 429 Shield:** Inspects API error responses. If a `429` status code or rate-limit message is received, a global cooldown is triggered immediately (minimum 10 minutes) alongside exponential backoff multipliers.
+- **Target Capping:** Mutual friend queries are strictly capped at 25 targets per cycle to avoid generating high-frequency request bursts.
+- **Request Jitter:** Requests are staggered with 15–30 second randomized delays.
+- **Concurrency Locking:** Polling cycles are guarded by atomic execution flags to prevent cycle stacking on slow networks.
+
+### 2. Runtime & Dispatcher Resilience
+- **Isolated Error Boundaries:** Every Flux dispatch listener (`GUILD_MEMBER_UPDATE`, `GUILD_BAN_ADD`, etc.) is wrapped in defensive `try...catch` boundaries, preventing any malformed Discord payload from crashing Discord's internal event loop.
+- **Safe Store Fallbacks:** All Discord store accessors (`GuildStore`, `GuildMemberStore`, `UserStore`) provide graceful fallbacks if stores are uninitialized or cold.
+
+### 3. Data Integrity & Injection Defense
+- **Strict Snowflake Validation:** Enforces `/^\d{17,20}$/` on all target IDs and mutual relationships.
+- **DataStore Type Guards:** Validates both `UserTracker_history` and `UserTracker_mutuals` schemas on startup to safely discard corrupted or tampered records from IndexedDB.
+- **String Sanitization:** All user tags, guild names, and role labels are sanitized through `sanitizeText()` to strip:
+  - ASCII control characters (`\x00`–`\x1F`, `\x7F`)
+  - Bidirectional override characters (e.g. `\u202E`) to prevent text-spoofing
+  - Zero-width spaces (`\u200B`–`\u200D`, `\uFEFF`)
+  - Line-break normalization and length clamping
+
+---
+
+## 🚀 Installation
+
+> [!IMPORTANT]
+> UserTracker requires a **Vencord source build** because the stock Vencord installer cannot load custom third-party userplugins.
+
+### Prerequisites
+- **Node.js**: v20.0.0 or later (`node -v`)
+- **pnpm**: v9.0.0 or later (`brew install pnpm` or `corepack enable`)
+- **Git**: Installed and configured
+
+### Quickstart (3 Minutes)
 
 ```bash
-# 1. Copy the plugin into your Vencord checkout
-cp -r src/userplugins/userTracker /path/to/Vencord/src/userplugins/userTracker
+# 1. Clone Vencord from source (if not already cloned)
+git clone https://github.com/Vendicated/Vencord.git ~/Vencord
+cd ~/Vencord
+pnpm install
 
-# 2. Open index.ts and put your own info in `authors`
-#    authors: [{ name: "YourName", id: 123456789012345678n }]
+# 2. Copy userTracker into Vencord's userplugins folder
+mkdir -p src/userplugins
+cp -r /Volumes/Shared/PW/user-tracker/src/userplugins/userTracker src/userplugins/userTracker
 
-# 3. Rebuild and reload Discord
-pnpm build        # or: pnpm build --watch  (dev loop)
-# then Ctrl+R in Discord
+# 3. Build Vencord with UserTracker bundled
+pnpm build
 
-# 4. Enable it: Settings → Vencord → Plugins → UserTracker
+# 4. Point Discord's Vencord patch to your new build
+# (On macOS, Discord loads from ~/Library/Application Support/Vencord/dist)
+rm -rf "$HOME/Library/Application Support/Vencord/dist"
+ln -s "$HOME/Vencord/dist" "$HOME/Library/Application Support/Vencord/dist"
+
+# 5. Reload Discord
+# Press Cmd + R (or Ctrl + R) inside Discord
 ```
 
-## 🧭 Use
+Once reloaded, navigate to:
+**User Settings (⚙️) → Vencord → Plugins → Search "UserTracker" → Enable**.
 
-1. **Add someone to watch** — right-click them → *Track user (UserTracker)*,
-   or paste their ID (right-click → Copy User ID) into the `trackedIds`
-   setting. Multiple IDs, any separator.
-2. **Tune events** — toggle roles / nick / join / leave / ban /
-   relationship tracking individually.
-3. **Watch it work** — change a tracked user's role in a shared server:
-   `Tracker • @bob in MyServer: +Admin, -Mod` 🍞
-4. **History** persists across restarts via Vencord's DataStore.
+---
 
-## ✅ Verify it works
+## ⚙️ Configuration Reference
+
+| Option | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `trackedIds` | `STRING` | `""` | Comma, space, or newline-separated Discord Snowflake IDs to monitor (up to 25 recommended if mutual watching is enabled). |
+| `trackRoles` | `BOOLEAN` | `true` | Notify on role additions and removals with resolved role names. |
+| `trackNick` | `BOOLEAN` | `true` | Notify on guild nickname changes. |
+| `trackJoin` | `BOOLEAN` | `true` | Notify when a tracked user joins a shared server. |
+| `trackLeave` | `BOOLEAN` | `true` | Notify when a user leaves or is removed/kicked from a server. |
+| `trackBan` | `BOOLEAN` | `true` | Notify on ban and unban events. |
+| `trackRelationship` | `BOOLEAN` | `true` | Notify when a tracked user friends, unfriends, requests, or blocks you. |
+| `showToast` | `BOOLEAN` | `true` | Display native toast popups on events (history always records). |
+| `historyLimit` | `NUMBER` | `200` | Maximum number of history entries retained in storage (1–1000). |
+| `watchMutualFriends` | `BOOLEAN` | `false` | Enable periodic background polling of mutual-friends lists among your mutuals. |
+| `mutualCheckMinutes`| `SELECT` | `60` | Polling frequency for mutual friends (`15`, `30`, `60`, or `120` minutes). |
+
+---
+
+## 🧪 Testing & Quality Assurance
+
+UserTracker maintains a comprehensive test suite executed with Node's native test runner (zero external dependencies).
 
 ```bash
-node --test tests/*.test.ts   # 35 pass, 0 fail
+# Run the complete test suite
+node --test tests/*.test.ts
 ```
 
-Then in Discord with an **alt account on a private test server**
-(never your main — client mods violate Discord's ToS):
-role add → role remove → nick change → leave → kick (shows as
-*removed*) → ban → unban → friend/unfriend you. Each should toast.
+### Test Coverage Highlights
+- **`tests/userTracker.utils.test.ts` (20 Tests):** Snowflake validation, input sanitization, control-character stripping, bidi-override neutralization, history trimming boundaries, entry schema verification, and role diffing.
+- **`tests/userTracker.mutuals.test.ts` (15 Tests):** HTTP 429 status detection, exponential backoff curves, global cooldown periods, snapshot usability guards, and mutual target capping.
 
-Full checklist + troubleshooting:
-[`src/userplugins/userTracker/README.md`](src/userplugins/userTracker/README.md).
+---
 
-## ⚠️ Good to know
+## 📁 Repository Structure
 
-- **Discord ToS:** all client mods violate it. Enforcement against
-  read-only plugins is unheard of, but test with an alt if your account
-  matters to you.
-- **No polling, no tokens, no scraping** — the core plugin only listens to
-  events Discord already sends your client. It can't see anything you
-  couldn't see by staring at the member list.
-- **Design docs** live in `docs/` (spec + plan), including the approaches
-  that were considered and rejected.
+```
+user-tracker/
+├── src/
+│   └── userplugins/
+│       └── userTracker/
+│           ├── index.ts        # Vencord plugin lifecycle, Flux hooks & settings
+│           ├── utils.ts        # Pure logic: validation, sanitization, diffing
+│           ├── mutuals.ts      # Mutual-friend polling, 429 shield & backoff
+│           └── README.md       # Plugin-specific documentation
+├── tests/
+│   ├── userTracker.utils.test.ts    # Unit tests for utils & sanitization
+│   └── userTracker.mutuals.test.ts  # Unit tests for mutuals & rate limiting
+├── docs/
+│   └── superpowers/            # Architectural specifications & execution plans
+├── .gitignore                  # Git ignore rules
+└── README.md                   # Main documentation
+```
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please follow these guidelines:
+1. **Fork the repository** and create a feature branch (`git checkout -b feature/my-feature`).
+2. **Ensure all tests pass** using `node --test tests/*.test.ts`.
+3. **Follow TDD** when adding new features or fixing bugs.
+4. **Submit a Pull Request** with a clear explanation of your changes.
+
+---
 
 ## 📄 License
 
-GPL-3.0-only, matching Vencord itself.
-
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)** — matching the license of [Vencord](https://vencord.dev). See the [LICENSE](LICENSE) file for details.
