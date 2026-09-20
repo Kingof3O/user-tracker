@@ -34,14 +34,33 @@ friends or unfriends **you**.
 ```
 src/userplugins/userTracker/
 ├── index.ts     # Vencord adapter: settings, flux events, toasts, history
-├── utils.ts     # Pure logic (no Discord imports — unit tested)
+├── utils.ts     # Pure logic: validation, sanitization, diffing (unit tested)
+├── mutuals.ts   # Mutual friend logic: rate-limiting, 429 backoff, capping (unit tested)
 └── README.md    # Plugin install + usage + troubleshooting
 tests/
-└── userTracker.utils.test.ts   # 12 tests, Node built-in runner, zero deps
+├── userTracker.utils.test.ts    # 20 tests (validation, sanitization, diffing)
+└── userTracker.mutuals.test.ts  # 15 tests (rate-limits, 429 backoff, snapshot safety)
 docs/
 ├── superpowers/specs/  # Design spec
 └── superpowers/plans/  # Implementation plan
 ```
+
+## 🛡️ Hardening & Reliability
+
+This plugin is hardened for production reliability, account safety, and client stability:
+
+- **Discord API & Account Safety:**
+  - **HTTP 429 Shield:** Automatically detects rate-limit (429) responses. On 429, all mutual polling is immediately paused for a minimum 10-minute cooldown with exponential backoff multipliers.
+  - **Concurrency Locking:** Mutual polling cycles cannot overlap or stack if requests take longer than the polling interval.
+  - **Target Capping & Jitter:** Mutual polling is capped to 25 users per cycle with 15–30s randomized delays between requests to prevent burst patterns.
+- **Crash & Runtime Resilience:**
+  - **Flux Dispatcher Isolation:** All Flux event handlers are wrapped in try/catch boundaries so an unexpected Discord payload never crashes Discord's core event dispatcher.
+  - **Defensive Store Lookups:** Safe fallbacks for Discord internal stores (`GuildStore`, `GuildMemberStore`, `UserStore`).
+- **Data Integrity & Sanitization:**
+  - **Strict Snowflake Validation:** Enforces `/^\d{17,20}$/` for user and guild IDs.
+  - **DataStore Type Guards:** Validates `UserTracker_history` and `UserTracker_mutuals` schemas on startup to safely discard corrupted or tampered records from IndexedDB.
+  - **String Sanitization:** Strips control characters, zero-width characters, and bidirectional override characters (`\u202E`) from tags, guild names, and roles before rendering in toasts or history.
+  - **Cache Pruning:** Automatically purges untracked users from all internal caches (`roleCache`, `nickCache`, `mutualCache`, failure counters) to prevent memory leaks.
 
 ## 🚀 Install (2 minutes)
 
@@ -76,7 +95,7 @@ pnpm build        # or: pnpm build --watch  (dev loop)
 ## ✅ Verify it works
 
 ```bash
-node --test tests/userTracker.utils.test.ts   # 12 pass, 0 fail
+node --test tests/*.test.ts   # 35 pass, 0 fail
 ```
 
 Then in Discord with an **alt account on a private test server**
@@ -92,7 +111,7 @@ Full checklist + troubleshooting:
 - **Discord ToS:** all client mods violate it. Enforcement against
   read-only plugins is unheard of, but test with an alt if your account
   matters to you.
-- **No polling, no tokens, no scraping** — the plugin only listens to
+- **No polling, no tokens, no scraping** — the core plugin only listens to
   events Discord already sends your client. It can't see anything you
   couldn't see by staring at the member list.
 - **Design docs** live in `docs/` (spec + plan), including the approaches
@@ -101,3 +120,4 @@ Full checklist + troubleshooting:
 ## 📄 License
 
 GPL-3.0-only, matching Vencord itself.
+

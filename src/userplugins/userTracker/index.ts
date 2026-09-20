@@ -2,12 +2,12 @@ import { definePluginSettings } from "@api/Settings";
 import * as DataStore from "@api/DataStore";
 import definePlugin, { OptionType } from "@utils/types";
 import { GuildStore, GuildMemberStore, UserStore, showToast, Toasts, Menu, React, RestAPI } from "@webpack/common";
-import { buildEntry, diffRoles, formatRoleChange, formatSimpleEvent, isTracked, parseTrackedIds, trimHistory } from "./utils";
-import { computeBackoff, diffMutuals, formatMutualEvent, snapshotUsable } from "./mutuals";
+import { buildEntry, diffRoles, formatRoleChange, formatSimpleEvent, isTracked, parseTrackedIds, trimHistory, isValidTrackerEntry, sanitizeText } from "./utils";
+import { computeBackoff, diffMutuals, formatMutualEvent, snapshotUsable, isRateLimited, getRateLimitCooldown, capMutualTargets, isValidMutualCacheEntry } from "./mutuals";
 import type { TrackerEntry } from "./utils";
 
 const settings = definePluginSettings({
-    trackedIds: { type: OptionType.STRING, description: "Comma/space/newline separated user IDs to watch", default: "" },
+    trackedIds: { type: OptionType.STRING, description: "Comma/space/newline separated user IDs to watch (up to 25 recommended for mutual friends)", default: "" },
     trackRoles: { type: OptionType.BOOLEAN, description: "Notify on role add/remove", default: true },
     trackNick: { type: OptionType.BOOLEAN, description: "Notify on nickname change", default: true },
     trackJoin: { type: OptionType.BOOLEAN, description: "Notify on join", default: true },
@@ -38,6 +38,8 @@ const mutualFailures = new Map<string, number>();
 const mutualSkipCycles = new Map<string, number>();
 let mutualTimer: ReturnType<typeof setInterval> | null = null;
 let mutualTimeouts: ReturnType<typeof setTimeout>[] = [];
+let isMutualCycleRunning = false;
+let rateLimitCooldownUntil = 0;
 const history: TrackerEntry[] = [];
 let loaded = false;
 
@@ -51,7 +53,8 @@ function cacheKey(guildId: string, userId: string): string {
 
 function guildNameOf(guildId: string): string {
     try {
-        return GuildStore.getGuild(guildId)?.name ?? guildId;
+        const name = GuildStore.getGuild(guildId)?.name;
+        return name ? sanitizeText(name, 100) : guildId;
     } catch { return guildId; }
 }
 
@@ -59,14 +62,50 @@ function userTagOf(userId: string): string {
     try {
         const u = UserStore.getUser(userId) as any;
         if (!u) return userId;
-        return u.globalName ? `${u.globalName} (@${u.username})` : `@${u.username ?? userId}`;
+        const tag = u.globalName ? `${u.globalName} (@${u.username})` : `@${u.username ?? userId}`;
+        return sanitizeText(tag, 100);
     } catch { return userId; }
 }
 
 function roleNameOf(guildId: string, roleId: string): string {
     try {
-        return GuildStore.getRole(guildId, roleId)?.name ?? roleId;
+        const name = GuildStore.getRole(guildId, roleId)?.name;
+        return name ? sanitizeText(name, 50) : roleId;
     } catch { return roleId; }
+}
+
+function pruneUntracked(activeTracked: string[]): void {
+    const activeSet = new Set(activeTracked);
+    for (const key of roleCache.keys()) {
+        const parts = key.split(":");
+        const userId = parts[1];
+        if (userId && !activeSet.has(userId)) {
+            roleCache.delete(key);
+        }
+    }
+    for (const key of nickCache.keys()) {
+        const parts = key.split(":");
+        const userId = parts[1];
+        if (userId && !activeSet.has(userId)) {
+            nickCache.delete(key);
+        }
+    }
+    for (const userId of mutualCache.keys()) {
+        if (!activeSet.has(userId)) {
+            mutualCache.delete(userId);
+        }
+    }
+    for (const userId of mutualFailures.keys()) {
+        if (!activeSet.has(userId)) {
+            mutualFailures.delete(userId);
+        }
+    }
+    for (const userId of mutualSkipCycles.keys()) {
+        if (!activeSet.has(userId)) {
+            mutualSkipCycles.delete(userId);
+        }
+    }
+    void persistMutuals();
 }
 
 async function persistHistory(): Promise<void> {
@@ -89,73 +128,83 @@ async function record(entry: TrackerEntry): Promise<void> {
 }
 
 function handleMemberUpdate(e: any): void {
-    const userId: string | undefined = e?.user?.id ?? e?.userId;
-    const guildId: string | undefined = e?.guildId;
-    if (!userId || !guildId || !isTracked(userId, trackedList())) return;
-    const newRoles: string[] = Array.isArray(e?.roles) ? e.roles : [];
-    const key = cacheKey(guildId, userId);
-    const oldRoles = roleCache.get(key);
-    roleCache.set(key, [...newRoles]);
-    const hasNickInfo = typeof e?.nick !== "undefined";
-    const cachedNick = nickCache.get(key);
-    let nickChanged = false;
-    if (hasNickInfo) {
-        const newNick: string | null = e.nick ?? null;
-        if (cachedNick !== undefined && newNick !== cachedNick) {
-            nickChanged = true;
+    try {
+        const userId: string | undefined = e?.user?.id ?? e?.userId;
+        const guildId: string | undefined = e?.guildId;
+        if (!userId || !guildId || !isTracked(userId, trackedList())) return;
+        const newRoles: string[] = Array.isArray(e?.roles) ? e.roles : [];
+        const key = cacheKey(guildId, userId);
+        const oldRoles = roleCache.get(key);
+        roleCache.set(key, [...newRoles]);
+        const hasNickInfo = typeof e?.nick !== "undefined";
+        const cachedNick = nickCache.get(key);
+        let nickChanged = false;
+        if (hasNickInfo) {
+            const newNick: string | null = e.nick ?? null;
+            if (cachedNick !== undefined && newNick !== cachedNick) {
+                nickChanged = true;
+            }
+            nickCache.set(key, newNick);
         }
-        nickCache.set(key, newNick);
-    }
-    if (!oldRoles) return;
-    const { added, removed } = diffRoles(oldRoles, newRoles);
-    if (settings.store.trackRoles && (added.length > 0 || removed.length > 0)) {
-        const detail = formatRoleChange(userTagOf(userId), guildNameOf(guildId), added.map(r => roleNameOf(guildId, r)), removed.map(r => roleNameOf(guildId, r)));
-        void record(buildEntry({ userId, userTag: userTagOf(userId), guildId, guildName: guildNameOf(guildId), kind: "roles", detail }));
-    }
-    if (settings.store.trackNick && nickChanged) {
-        const detail = formatSimpleEvent(userTagOf(userId), guildNameOf(guildId), `nickname → ${String(e.nick ?? "none")}`);
-        void record(buildEntry({ userId, userTag: userTagOf(userId), guildId, guildName: guildNameOf(guildId), kind: "nick", detail }));
-    }
+        if (!oldRoles) return;
+        const { added, removed } = diffRoles(oldRoles, newRoles);
+        if (settings.store.trackRoles && (added.length > 0 || removed.length > 0)) {
+            const detail = formatRoleChange(userTagOf(userId), guildNameOf(guildId), added.map(r => roleNameOf(guildId, r)), removed.map(r => roleNameOf(guildId, r)));
+            void record(buildEntry({ userId, userTag: userTagOf(userId), guildId, guildName: guildNameOf(guildId), kind: "roles", detail }));
+        }
+        if (settings.store.trackNick && nickChanged) {
+            const detail = formatSimpleEvent(userTagOf(userId), guildNameOf(guildId), `nickname → ${String(e.nick ?? "none")}`);
+            void record(buildEntry({ userId, userTag: userTagOf(userId), guildId, guildName: guildNameOf(guildId), kind: "nick", detail }));
+        }
+    } catch { /* isolated flux dispatch handler */ }
 }
 
 function handleMemberAdd(e: any): void {
-    const userId: string | undefined = e?.user?.id ?? e?.userId;
-    const guildId: string | undefined = e?.guildId ?? e?.guild?.id;
-    if (!userId || !guildId || !isTracked(userId, trackedList())) return;
-    if (Array.isArray(e?.roles)) roleCache.set(cacheKey(guildId, userId), [...e.roles]);
-    nickCache.set(cacheKey(guildId, userId), e.nick ?? null);
-    if (!settings.store.trackJoin) return;
-    const detail = formatSimpleEvent(userTagOf(userId), guildNameOf(guildId), "joined");
-    void record(buildEntry({ userId, userTag: userTagOf(userId), guildId, guildName: guildNameOf(guildId), kind: "join", detail }));
+    try {
+        const userId: string | undefined = e?.user?.id ?? e?.userId;
+        const guildId: string | undefined = e?.guildId ?? e?.guild?.id;
+        if (!userId || !guildId || !isTracked(userId, trackedList())) return;
+        if (Array.isArray(e?.roles)) roleCache.set(cacheKey(guildId, userId), [...e.roles]);
+        nickCache.set(cacheKey(guildId, userId), e.nick ?? null);
+        if (!settings.store.trackJoin) return;
+        const detail = formatSimpleEvent(userTagOf(userId), guildNameOf(guildId), "joined");
+        void record(buildEntry({ userId, userTag: userTagOf(userId), guildId, guildName: guildNameOf(guildId), kind: "join", detail }));
+    } catch { /* isolated flux dispatch handler */ }
 }
 
 function handleMemberRemove(e: any): void {
-    const userId: string | undefined = e?.user?.id ?? e?.userId;
-    const guildId: string | undefined = e?.guildId;
-    if (!userId || !guildId || !isTracked(userId, trackedList())) return;
-    roleCache.delete(cacheKey(guildId, userId));
-    nickCache.delete(cacheKey(guildId, userId));
-    if (!settings.store.trackLeave) return;
-    const detail = formatSimpleEvent(userTagOf(userId), guildNameOf(guildId), "left or was removed (check audit log for kick vs leave)");
-    void record(buildEntry({ userId, userTag: userTagOf(userId), guildId, guildName: guildNameOf(guildId), kind: "leave", detail }));
+    try {
+        const userId: string | undefined = e?.user?.id ?? e?.userId;
+        const guildId: string | undefined = e?.guildId;
+        if (!userId || !guildId || !isTracked(userId, trackedList())) return;
+        roleCache.delete(cacheKey(guildId, userId));
+        nickCache.delete(cacheKey(guildId, userId));
+        if (!settings.store.trackLeave) return;
+        const detail = formatSimpleEvent(userTagOf(userId), guildNameOf(guildId), "left or was removed (check audit log for kick vs leave)");
+        void record(buildEntry({ userId, userTag: userTagOf(userId), guildId, guildName: guildNameOf(guildId), kind: "leave", detail }));
+    } catch { /* isolated flux dispatch handler */ }
 }
 
 function handleBanAdd(e: any): void {
-    const userId: string | undefined = e?.user?.id ?? e?.userId;
-    const guildId: string | undefined = e?.guildId;
-    if (!userId || !guildId || !isTracked(userId, trackedList())) return;
-    if (!settings.store.trackBan) return;
-    const detail = formatSimpleEvent(userTagOf(userId), guildNameOf(guildId), "banned");
-    void record(buildEntry({ userId, userTag: userTagOf(userId), guildId: guildId, guildName: guildNameOf(guildId), kind: "ban", detail }));
+    try {
+        const userId: string | undefined = e?.user?.id ?? e?.userId;
+        const guildId: string | undefined = e?.guildId;
+        if (!userId || !guildId || !isTracked(userId, trackedList())) return;
+        if (!settings.store.trackBan) return;
+        const detail = formatSimpleEvent(userTagOf(userId), guildNameOf(guildId), "banned");
+        void record(buildEntry({ userId, userTag: userTagOf(userId), guildId: guildId, guildName: guildNameOf(guildId), kind: "ban", detail }));
+    } catch { /* isolated flux dispatch handler */ }
 }
 
 function handleBanRemove(e: any): void {
-    const userId: string | undefined = e?.user?.id ?? e?.userId;
-    const guildId: string | undefined = e?.guildId;
-    if (!userId || !guildId || !isTracked(userId, trackedList())) return;
-    if (!settings.store.trackBan) return;
-    const detail = formatSimpleEvent(userTagOf(userId), guildNameOf(guildId), "unbanned");
-    void record(buildEntry({ userId, userTag: userTagOf(userId), guildId, guildName: guildNameOf(guildId), kind: "unban", detail }));
+    try {
+        const userId: string | undefined = e?.user?.id ?? e?.userId;
+        const guildId: string | undefined = e?.guildId;
+        if (!userId || !guildId || !isTracked(userId, trackedList())) return;
+        if (!settings.store.trackBan) return;
+        const detail = formatSimpleEvent(userTagOf(userId), guildNameOf(guildId), "unbanned");
+        void record(buildEntry({ userId, userTag: userTagOf(userId), guildId, guildName: guildNameOf(guildId), kind: "unban", detail }));
+    } catch { /* isolated flux dispatch handler */ }
 }
 
 async function persistMutuals(): Promise<void> {
@@ -165,6 +214,7 @@ async function persistMutuals(): Promise<void> {
 }
 
 async function checkMutuals(userId: string, silentBaseline: boolean): Promise<void> {
+    if (Date.now() < rateLimitCooldownUntil) return;
     const skipped = mutualSkipCycles.get(userId) ?? 0;
     if (skipped > 0) {
         mutualSkipCycles.set(userId, skipped - 1);
@@ -173,10 +223,14 @@ async function checkMutuals(userId: string, silentBaseline: boolean): Promise<vo
     let body: any;
     try {
         body = await RestAPI.get({ url: `/users/${userId}/profile?with_mutual_friends_count=true` });
-    } catch {
+    } catch (err: unknown) {
+        const is429 = isRateLimited(err);
         const failures = (mutualFailures.get(userId) ?? 0) + 1;
         mutualFailures.set(userId, failures);
-        mutualSkipCycles.set(userId, computeBackoff(failures));
+        mutualSkipCycles.set(userId, computeBackoff(failures, is429));
+        if (is429) {
+            rateLimitCooldownUntil = Date.now() + getRateLimitCooldown(true);
+        }
         return;
     }
     mutualFailures.set(userId, 0);
@@ -202,10 +256,28 @@ async function checkMutuals(userId: string, silentBaseline: boolean): Promise<vo
 }
 
 function runMutualCycle(silentBaseline: boolean): void {
-    const list = trackedList();
+    if (isMutualCycleRunning) return;
+    if (Date.now() < rateLimitCooldownUntil) return;
+    const allTracked = trackedList();
+    pruneUntracked(allTracked);
+    const list = capMutualTargets(allTracked, 25);
+    if (list.length === 0) return;
+
+    isMutualCycleRunning = true;
+    let completed = 0;
     list.forEach((userId, i) => {
         const delay = i * 15000 + Math.floor(Math.random() * 10000);
-        mutualTimeouts.push(setTimeout(() => void checkMutuals(userId, silentBaseline), delay));
+        const timer = setTimeout(async () => {
+            try {
+                await checkMutuals(userId, silentBaseline);
+            } finally {
+                completed++;
+                if (completed >= list.length) {
+                    isMutualCycleRunning = false;
+                }
+            }
+        }, delay);
+        mutualTimeouts.push(timer);
     });
 }
 
@@ -216,6 +288,7 @@ function stopMutualLoop(): void {
     }
     for (const t of mutualTimeouts) clearTimeout(t);
     mutualTimeouts = [];
+    isMutualCycleRunning = false;
 }
 
 function startMutualLoop(): void {
@@ -228,27 +301,29 @@ function startMutualLoop(): void {
 }
 
 function handleRelationship(e: any, action: "add" | "remove"): void {
-    const userId: string | undefined = e?.userId ?? e?.user?.id;
-    if (!userId || !isTracked(userId, trackedList())) return;
-    if (!settings.store.trackRelationship) return;
-    const relType = e?.relationship?.type ?? e?.type;
-    const tag = userTagOf(userId);
-    let detail: string;
-    if (action === "add") {
-        if (relType === 2) {
-            detail = `Tracker • ${tag}: blocked you`;
-        } else if (relType === 3) {
-            detail = `Tracker • ${tag} sent you a friend request`;
-        } else if (relType === 4) {
-            detail = `Tracker • ${tag} received your friend request`;
+    try {
+        const userId: string | undefined = e?.userId ?? e?.user?.id;
+        if (!userId || !isTracked(userId, trackedList())) return;
+        if (!settings.store.trackRelationship) return;
+        const relType = e?.relationship?.type ?? e?.type;
+        const tag = userTagOf(userId);
+        let detail: string;
+        if (action === "add") {
+            if (relType === 2) {
+                detail = `Tracker • ${tag}: blocked you`;
+            } else if (relType === 3) {
+                detail = `Tracker • ${tag} sent you a friend request`;
+            } else if (relType === 4) {
+                detail = `Tracker • ${tag} received your friend request`;
+            } else {
+                detail = `Tracker • ${tag}: became friends with you`;
+            }
         } else {
-            detail = `Tracker • ${tag}: became friends with you`;
+            const label = relType === 2 ? "unblocked" : "unfriended";
+            detail = `Tracker • ${tag}: ${label} you`;
         }
-    } else {
-        const label = relType === 2 ? "unblocked" : "unfriended";
-        detail = `Tracker • ${tag}: ${label} you`;
-    }
-    void record(buildEntry({ userId, userTag: tag, guildId: "@me", guildName: "Direct relationship", kind: "relationship", detail }));
+        void record(buildEntry({ userId, userTag: tag, guildId: "@me", guildName: "Direct relationship", kind: "relationship", detail }));
+    } catch { /* isolated flux dispatch handler */ }
 }
 
 export default definePlugin({
@@ -277,8 +352,11 @@ export default definePlugin({
                         id: "usertracker-toggle",
                         label: tracked ? "Untrack user (UserTracker)" : "Track user (UserTracker)",
                         action: () => {
-                            const next = tracked ? list.filter(id => id !== userId) : [...list, userId];
-                            settings.store.trackedIds = next.join(", ");
+                            try {
+                                const next = tracked ? list.filter(id => id !== userId) : [...list, userId];
+                                settings.store.trackedIds = next.join(", ");
+                                pruneUntracked(next);
+                            } catch { /* best-effort update */ }
                         },
                     })
                 );
@@ -292,19 +370,26 @@ export default definePlugin({
             loaded = true;
             try {
                 const saved = await DataStore.get<TrackerEntry[]>(HISTORY_KEY);
-                if (Array.isArray(saved)) history.push(...trimHistory(saved, 1000));
+                if (Array.isArray(saved)) {
+                    const validEntries = saved.filter(isValidTrackerEntry);
+                    history.push(...trimHistory(validEntries, 1000));
+                }
             } catch { /* fresh start with empty history */ }
             try {
-                const savedMutuals = await DataStore.get<[string, string[]][]>(MUTUALS_KEY);
+                const savedMutuals = await DataStore.get<unknown>(MUTUALS_KEY);
                 if (Array.isArray(savedMutuals)) {
-                    for (const [userId, ids] of savedMutuals) {
-                        if (typeof userId === "string" && Array.isArray(ids)) mutualCache.set(userId, ids);
+                    for (const entry of savedMutuals) {
+                        if (isValidMutualCacheEntry(entry)) {
+                            mutualCache.set(entry[0], entry[1]);
+                        }
                     }
                 }
             } catch { /* fresh mutual baseline */ }
         }
         try {
-            for (const userId of trackedList()) {
+            const tracked = trackedList();
+            pruneUntracked(tracked);
+            for (const userId of tracked) {
                 for (const guildId of Object.keys(GuildStore.getGuilds?.() ?? {})) {
                     try {
                         const member = GuildMemberStore.getMember(guildId, userId);
@@ -323,3 +408,4 @@ export default definePlugin({
         stopMutualLoop();
     },
 });
+
