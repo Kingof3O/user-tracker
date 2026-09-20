@@ -10,9 +10,10 @@ friends or unfriends **you**.
 
 > **Honest limits, up front:** Discord never tells your client when someone
 > is *kicked* (vs. leaving on their own) — those events show as
-> “left or was removed”. And nobody's client receives *other people's*
-> friend events, so friend tracking covers only **you ↔ tracked user**,
-> never target ↔ stranger. Anything claiming otherwise is lying to you.
+> “left or was removed”. Instant friend alerts cover **you ↔ tracked user**
+> only; the opt-in mutual-friend poller additionally sees tracked-user
+> changes among **your own friends** (hourly-ish, not instant), while a
+> tracked user friending a stranger stays invisible to everyone but them.
 
 ---
 
@@ -23,6 +24,7 @@ friends or unfriends **you**.
 - 👋 **Join / leave / ban / unban** detection per server
 - 💬 **Nickname** change alerts
 - 🤝 **You ↔ target** friend/unfriend, block, and request alerts
+- 👥 **Mutual-friend watching (opt-in)** — detects when a tracked user friends/unfriends *your* friends, via timed profile snapshots
 - 🔔 **Toast popups** + persistent, searchable history (survives restarts)
 - 🖱️ **Right-click any user → Track/Untrack** from the context menu
 - 🧩 **Zero webpack patches** — pure event listeners, no restart needed

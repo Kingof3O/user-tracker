@@ -1,4 +1,4 @@
-export type TrackerKind = "roles" | "nick" | "join" | "leave" | "ban" | "unban" | "relationship";
+export type TrackerKind = "roles" | "nick" | "join" | "leave" | "ban" | "unban" | "relationship" | "mutual-friend";
 
 export interface TrackerEntry {
     id: string;
